@@ -25,6 +25,7 @@ static CACHED_PATTERNS: OnceLock<Vec<CompiledPattern>> = OnceLock::new();
 
 /// Agent guard configuration structure (versioned schema).
 #[derive(Debug, Clone, Deserialize)]
+#[allow(dead_code)]
 pub struct GuardConfig {
     #[serde(default = "default_schema_version")]
     pub schema_version: String,
@@ -36,6 +37,7 @@ pub struct GuardConfig {
 
 /// Metadata about the configuration file.
 #[derive(Debug, Clone, Deserialize)]
+#[allow(dead_code)]
 pub struct ConfigMetadata {
     pub source: String,
     pub version: String,
