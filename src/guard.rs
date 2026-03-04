@@ -315,9 +315,13 @@ pub fn handle_guard() -> Result<()> {
 
     // File-path tools: validate path against allowed directories
     if matches!(tool_name, "Edit" | "Write" | "Read" | "NotebookEdit") {
-        if let Some(ref ti) = hook_input.tool_input {
-            let path = ti.file_path.as_ref().or(ti.notebook_path.as_ref());
-            if let Some(fp) = path {
+        let path = hook_input
+            .tool_input
+            .as_ref()
+            .and_then(|ti| ti.file_path.as_ref().or(ti.notebook_path.as_ref()));
+
+        match path {
+            Some(fp) => {
                 if let Some(denial) = evaluate_file_path(tool_name, fp) {
                     let output = HookOutput {
                         hook_specific_output: HookSpecificOutput {
@@ -329,11 +333,32 @@ pub fn handle_guard() -> Result<()> {
                     println!("{}", serde_json::to_string(&output)?);
                 }
             }
+            None => {
+                // When sandboxing is active, deny file-path tools with no path
+                // to prevent bypass via malformed payloads
+                if std::env::var("AGENT_ALLOWED_PATHS").map_or(false, |v| !v.is_empty()) {
+                    let output = HookOutput {
+                        hook_specific_output: HookSpecificOutput {
+                            hook_event_name: "PreToolUse".to_string(),
+                            permission_decision: "deny".to_string(),
+                            permission_decision_reason: format!(
+                                "{} blocked: no file path provided for sandboxed tool.",
+                                tool_name
+                            ),
+                        },
+                    };
+                    println!("{}", serde_json::to_string(&output)?);
+                }
+            }
         }
         return Ok(());
     }
 
-    // Bash tool: check command for destructive patterns
+    // Only evaluate Bash tool for destructive command patterns
+    if !matches!(tool_name, "" | "Bash") {
+        return Ok(());
+    }
+
     let command = match parse_command(&input) {
         Some(cmd) => cmd,
         None => return Ok(()), // No command to evaluate — allow
@@ -431,7 +456,9 @@ fn evaluate_file_path_with_allowed(
         }
         // Resolve the prefix too, so symlinks match (e.g., /tmp -> /private/tmp on macOS)
         let resolved_prefix = resolve_path(&prefix.to_string_lossy());
-        if resolved.starts_with(&resolved_prefix) {
+        // Use Path::starts_with for component-aware comparison, preventing
+        // prefix bypass (e.g., /tmp/safe matching /tmp/safevil)
+        if Path::new(&resolved).starts_with(Path::new(&resolved_prefix)) {
             return None; // Path is within an allowed prefix
         }
     }
@@ -476,13 +503,33 @@ fn resolve_path(path: &str) -> String {
             for component in to_append.iter().rev() {
                 result = result.join(component);
             }
-            return result.to_string_lossy().to_string();
+            // Normalize away any remaining `..` components to prevent traversal
+            return normalize_path(&result).to_string_lossy().to_string();
         }
         current = parent.to_path_buf();
     }
 
-    // Last resort: return as-is (already absolute from Claude Code)
-    path.to_string()
+    // Last resort: normalize and return (already absolute from Claude Code)
+    normalize_path(Path::new(path)).to_string_lossy().to_string()
+}
+
+/// Normalize a path by collapsing `.` and `..` components logically.
+/// Unlike `canonicalize`, this does not require the path to exist.
+fn normalize_path(path: &Path) -> std::path::PathBuf {
+    use std::path::Component;
+    let mut normalized = std::path::PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::ParentDir => {
+                normalized.pop();
+            }
+            Component::CurDir => {}
+            _ => {
+                normalized.push(component);
+            }
+        }
+    }
+    normalized
 }
 
 // ── Input Parsing ───────────────────────────────────────
@@ -1376,7 +1423,11 @@ message = "medium priority"
 
     #[test]
     fn file_path_allows_within_prefix() {
-        let allowed = "/tmp/worktrees/test:/tmp";
+        let allowed = std::env::join_paths(["/tmp/worktrees/test", "/tmp"])
+            .unwrap()
+            .to_string_lossy()
+            .to_string();
+        let allowed = allowed.as_str();
         assert!(evaluate_file_path_with_allowed(
             "Edit",
             "/tmp/worktrees/test/src/main.rs",
@@ -1408,7 +1459,11 @@ message = "medium priority"
 
     #[test]
     fn file_path_multiple_prefixes() {
-        let allowed = "/tmp/worktrees/test:/home/user/.kb:/tmp";
+        let allowed = std::env::join_paths(["/tmp/worktrees/test", "/home/user/.kb", "/tmp"])
+            .unwrap()
+            .to_string_lossy()
+            .to_string();
+        let allowed = allowed.as_str();
         assert!(evaluate_file_path_with_allowed(
             "Write",
             "/home/user/.kb/workspace/task.md",
@@ -1431,6 +1486,36 @@ message = "medium priority"
             evaluate_file_path_with_allowed("NotebookEdit", "/forbidden/notebook.ipynb", allowed)
                 .unwrap();
         assert!(result.reason.contains("NotebookEdit"));
+    }
+
+    #[test]
+    fn file_path_denies_traversal_via_dotdot() {
+        let allowed = "/tmp/worktrees/test";
+        // Attempt to escape via .. in a non-existent path
+        let result = evaluate_file_path_with_allowed(
+            "Write",
+            "/tmp/worktrees/test/nonexistent/../../etc/passwd",
+            allowed,
+        );
+        assert!(
+            result.is_some(),
+            "path traversal via .. should be denied"
+        );
+    }
+
+    #[test]
+    fn file_path_denies_prefix_partial_match() {
+        let allowed = "/tmp/safe";
+        // /tmp/safevil should NOT match /tmp/safe
+        let result = evaluate_file_path_with_allowed(
+            "Edit",
+            "/tmp/safevil/malicious.sh",
+            allowed,
+        );
+        assert!(
+            result.is_some(),
+            "partial directory name match should be denied"
+        );
     }
 
     // ── handle_guard with tool_name ─────────────────────
