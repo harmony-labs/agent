@@ -1,8 +1,14 @@
-//! Deterministic destructive command detection for Claude Code PreToolUse hooks.
+//! Deterministic destructive command detection and file path sandboxing for
+//! Claude Code PreToolUse hooks.
 //!
-//! Reads hook JSON from stdin, evaluates the Bash command for destructive patterns,
-//! and returns structured JSON to block or allow execution. No LLM evaluation —
-//! pure pattern matching in Rust.
+//! Reads hook JSON from stdin, evaluates the tool input, and returns structured
+//! JSON to block or allow execution. No LLM evaluation — pure pattern matching
+//! in Rust.
+//!
+//! Two modes:
+//! - **Bash guard**: Evaluates Bash commands for destructive patterns (always active).
+//! - **File path sandbox**: When `AGENT_ALLOWED_PATHS` is set, restricts Edit/Write/Read/
+//!   NotebookEdit tools to allowed directory prefixes. Inactive in interactive mode.
 //!
 //! Configuration is loaded from `.claude/agent-guard.toml` (project-level) or
 //! `~/.claude/agent-guard.toml` (user-level), with embedded defaults as fallback.
@@ -286,12 +292,48 @@ impl GuardConfig {
 
 /// Entry point for `meta agent guard`.
 ///
-/// Reads PreToolUse hook JSON from stdin, evaluates the command,
-/// prints denial JSON to stdout if destructive, exits silently if safe.
+/// Reads PreToolUse hook JSON from stdin, evaluates the tool input,
+/// prints denial JSON to stdout if blocked, exits silently if safe.
+///
+/// For Bash tools: checks command against destructive patterns.
+/// For Edit/Write/Read/NotebookEdit: validates file_path against `AGENT_ALLOWED_PATHS`.
 pub fn handle_guard() -> Result<()> {
     let mut input = String::new();
     std::io::stdin().read_to_string(&mut input)?;
 
+    let trimmed = input.trim();
+    if trimmed.is_empty() {
+        return Ok(());
+    }
+
+    let hook_input: HookInput = match serde_json::from_str(trimmed) {
+        Ok(hi) => hi,
+        Err(_) => return Ok(()), // Malformed input — allow
+    };
+
+    let tool_name = hook_input.tool_name.as_deref().unwrap_or("");
+
+    // File-path tools: validate path against allowed directories
+    if matches!(tool_name, "Edit" | "Write" | "Read" | "NotebookEdit") {
+        if let Some(ref ti) = hook_input.tool_input {
+            let path = ti.file_path.as_ref().or(ti.notebook_path.as_ref());
+            if let Some(fp) = path {
+                if let Some(denial) = evaluate_file_path(tool_name, fp) {
+                    let output = HookOutput {
+                        hook_specific_output: HookSpecificOutput {
+                            hook_event_name: "PreToolUse".to_string(),
+                            permission_decision: "deny".to_string(),
+                            permission_decision_reason: denial.reason,
+                        },
+                    };
+                    println!("{}", serde_json::to_string(&output)?);
+                }
+            }
+        }
+        return Ok(());
+    }
+
+    // Bash tool: check command for destructive patterns
     let command = match parse_command(&input) {
         Some(cmd) => cmd,
         None => return Ok(()), // No command to evaluate — allow
@@ -315,12 +357,15 @@ pub fn handle_guard() -> Result<()> {
 
 #[derive(Deserialize)]
 struct HookInput {
+    tool_name: Option<String>,
     tool_input: Option<ToolInput>,
 }
 
 #[derive(Deserialize)]
 struct ToolInput {
     command: Option<String>,
+    file_path: Option<String>,
+    notebook_path: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -343,6 +388,75 @@ struct HookSpecificOutput {
 #[derive(Debug, Clone, PartialEq)]
 pub struct DenyReason {
     pub reason: String,
+}
+
+// ── File Path Sandboxing ────────────────────────────────
+
+/// Validate a file path against `AGENT_ALLOWED_PATHS` (colon-separated prefixes).
+///
+/// When the env var is unset or empty, all paths are allowed (interactive mode).
+/// When set, the resolved path must start with at least one allowed prefix.
+/// Resolves symlinks and `..` components to prevent path traversal escapes.
+pub fn evaluate_file_path(tool_name: &str, file_path: &str) -> Option<DenyReason> {
+    let allowed = match std::env::var("AGENT_ALLOWED_PATHS") {
+        Ok(v) if !v.is_empty() => v,
+        _ => return None, // No restriction in interactive mode
+    };
+
+    // Resolve the path to catch traversal (../../..) and symlink escapes.
+    // For files that don't exist yet (Write creating new file), resolve the parent.
+    let resolved = resolve_path(file_path);
+
+    // Debug logging
+    if std::env::var("META_DEBUG_GUARD").is_ok() {
+        eprintln!(
+            "[agent-guard] File path check: tool={}, path={}, resolved={}",
+            tool_name, file_path, resolved
+        );
+    }
+
+    for prefix in allowed.split(':') {
+        let prefix = prefix.trim();
+        if prefix.is_empty() {
+            continue;
+        }
+        if resolved.starts_with(prefix) {
+            return None; // Path is within an allowed prefix
+        }
+    }
+
+    Some(DenyReason {
+        reason: format!(
+            "{} blocked: '{}' is outside the allowed workspace. Stay within your worktree.",
+            tool_name, file_path
+        ),
+    })
+}
+
+/// Resolve a file path to an absolute, canonical form.
+/// Handles symlinks and `..` components. Falls back to the raw path if resolution fails.
+fn resolve_path(path: &str) -> String {
+    let p = Path::new(path);
+
+    // Try full canonicalize first (file exists)
+    if let Ok(canonical) = p.canonicalize() {
+        return canonical.to_string_lossy().to_string();
+    }
+
+    // File doesn't exist — canonicalize parent, append filename
+    if let Some(parent) = p.parent() {
+        if let Ok(canonical_parent) = parent.canonicalize() {
+            if let Some(name) = p.file_name() {
+                return canonical_parent
+                    .join(name)
+                    .to_string_lossy()
+                    .to_string();
+            }
+        }
+    }
+
+    // Last resort: return as-is (already absolute from Claude Code)
+    path.to_string()
 }
 
 // ── Input Parsing ───────────────────────────────────────
@@ -1227,5 +1341,120 @@ message = "medium priority"
         assert_eq!(patterns[0].priority, 200);
         assert_eq!(patterns[1].priority, 100);
         assert_eq!(patterns[2].priority, 50);
+    }
+
+    // ── File path sandboxing ────────────────────────────
+
+    #[test]
+    fn file_path_allows_when_env_unset() {
+        std::env::remove_var("AGENT_ALLOWED_PATHS");
+        assert!(evaluate_file_path("Edit", "/some/random/path").is_none());
+        assert!(evaluate_file_path("Write", "/etc/passwd").is_none());
+    }
+
+    #[test]
+    fn file_path_allows_when_env_empty() {
+        std::env::set_var("AGENT_ALLOWED_PATHS", "");
+        assert!(evaluate_file_path("Read", "/any/path").is_none());
+        std::env::remove_var("AGENT_ALLOWED_PATHS");
+    }
+
+    #[test]
+    fn file_path_allows_within_prefix() {
+        std::env::set_var("AGENT_ALLOWED_PATHS", "/tmp/worktrees/test:/tmp");
+        assert!(evaluate_file_path("Edit", "/tmp/worktrees/test/src/main.rs").is_none());
+        assert!(evaluate_file_path("Write", "/tmp/somefile.txt").is_none());
+        std::env::remove_var("AGENT_ALLOWED_PATHS");
+    }
+
+    #[test]
+    fn file_path_denies_outside_prefix() {
+        std::env::set_var("AGENT_ALLOWED_PATHS", "/tmp/worktrees/test");
+        let result = evaluate_file_path("Edit", "/Users/matt/real-repo/src/main.rs");
+        assert!(result.is_some());
+        assert!(result.unwrap().reason.contains("outside the allowed workspace"));
+        std::env::remove_var("AGENT_ALLOWED_PATHS");
+    }
+
+    #[test]
+    fn file_path_denies_read_outside() {
+        std::env::set_var("AGENT_ALLOWED_PATHS", "/tmp/worktrees/test");
+        let result = evaluate_file_path("Read", "/Users/matt/real-repo/secrets.env");
+        assert!(result.is_some());
+        std::env::remove_var("AGENT_ALLOWED_PATHS");
+    }
+
+    #[test]
+    fn file_path_multiple_prefixes() {
+        std::env::set_var(
+            "AGENT_ALLOWED_PATHS",
+            "/tmp/worktrees/test:/home/user/.kb:/tmp",
+        );
+        assert!(evaluate_file_path("Write", "/home/user/.kb/workspace/task.md").is_none());
+        assert!(evaluate_file_path("Edit", "/tmp/worktrees/test/code.rs").is_none());
+        let result = evaluate_file_path("Edit", "/home/user/real-code/main.rs");
+        assert!(result.is_some());
+        std::env::remove_var("AGENT_ALLOWED_PATHS");
+    }
+
+    #[test]
+    fn file_path_denial_includes_tool_name() {
+        std::env::set_var("AGENT_ALLOWED_PATHS", "/tmp/allowed");
+        let result = evaluate_file_path("NotebookEdit", "/forbidden/notebook.ipynb").unwrap();
+        assert!(result.reason.contains("NotebookEdit"));
+        std::env::remove_var("AGENT_ALLOWED_PATHS");
+    }
+
+    // ── handle_guard with tool_name ─────────────────────
+
+    #[test]
+    fn parse_hook_input_with_tool_name() {
+        let input = r#"{"tool_name":"Edit","tool_input":{"file_path":"/tmp/test.rs"}}"#;
+        let hi: HookInput = serde_json::from_str(input).unwrap();
+        assert_eq!(hi.tool_name.as_deref(), Some("Edit"));
+        assert_eq!(
+            hi.tool_input.as_ref().unwrap().file_path.as_deref(),
+            Some("/tmp/test.rs")
+        );
+    }
+
+    #[test]
+    fn parse_hook_input_with_notebook_path() {
+        let input =
+            r#"{"tool_name":"NotebookEdit","tool_input":{"notebook_path":"/tmp/nb.ipynb"}}"#;
+        let hi: HookInput = serde_json::from_str(input).unwrap();
+        assert_eq!(hi.tool_name.as_deref(), Some("NotebookEdit"));
+        assert_eq!(
+            hi.tool_input.as_ref().unwrap().notebook_path.as_deref(),
+            Some("/tmp/nb.ipynb")
+        );
+    }
+
+    #[test]
+    fn parse_hook_input_bash_still_works() {
+        let input = r#"{"tool_name":"Bash","tool_input":{"command":"git status"}}"#;
+        let hi: HookInput = serde_json::from_str(input).unwrap();
+        assert_eq!(hi.tool_name.as_deref(), Some("Bash"));
+        assert_eq!(
+            hi.tool_input.as_ref().unwrap().command.as_deref(),
+            Some("git status")
+        );
+        assert!(hi.tool_input.as_ref().unwrap().file_path.is_none());
+    }
+
+    #[test]
+    fn resolve_path_handles_existing_paths() {
+        // /tmp should exist on all platforms
+        let resolved = resolve_path("/tmp");
+        assert!(resolved.starts_with('/'));
+        // On macOS, /tmp -> /private/tmp
+        assert!(resolved == "/tmp" || resolved == "/private/tmp");
+    }
+
+    #[test]
+    fn resolve_path_handles_nonexistent_files() {
+        let resolved = resolve_path("/tmp/nonexistent_guard_test_file.rs");
+        // Should resolve parent (/tmp or /private/tmp) + filename
+        assert!(resolved.ends_with("nonexistent_guard_test_file.rs"));
     }
 }
