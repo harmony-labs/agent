@@ -464,26 +464,21 @@ fn resolve_path(path: &str) -> String {
     let mut to_append = Vec::new();
     let mut current = p.to_path_buf();
 
-    loop {
-        if let Some(name) = current.file_name() {
-            to_append.push(name.to_os_string());
-        } else {
-            break;
-        }
+    while let Some(name) = current.file_name() {
+        to_append.push(name.to_os_string());
 
-        match current.parent() {
-            Some(parent) => {
-                if let Ok(canonical) = parent.canonicalize() {
-                    let mut result = canonical;
-                    for component in to_append.iter().rev() {
-                        result = result.join(component);
-                    }
-                    return result.to_string_lossy().to_string();
-                }
-                current = parent.to_path_buf();
+        let Some(parent) = current.parent() else {
+            break;
+        };
+
+        if let Ok(canonical) = parent.canonicalize() {
+            let mut result = canonical;
+            for component in to_append.iter().rev() {
+                result = result.join(component);
             }
-            None => break,
+            return result.to_string_lossy().to_string();
         }
+        current = parent.to_path_buf();
     }
 
     // Last resort: return as-is (already absolute from Claude Code)
