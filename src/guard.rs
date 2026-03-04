@@ -403,6 +403,15 @@ pub fn evaluate_file_path(tool_name: &str, file_path: &str) -> Option<DenyReason
         _ => return None, // No restriction in interactive mode
     };
 
+    evaluate_file_path_with_allowed(tool_name, file_path, &allowed)
+}
+
+/// Inner implementation that accepts allowed paths explicitly (testable without env vars).
+fn evaluate_file_path_with_allowed(
+    tool_name: &str,
+    file_path: &str,
+    allowed: &str,
+) -> Option<DenyReason> {
     // Resolve the path to catch traversal (../../..) and symlink escapes.
     // For files that don't exist yet (Write creating new file), resolve the parent.
     let resolved = resolve_path(file_path);
@@ -420,7 +429,9 @@ pub fn evaluate_file_path(tool_name: &str, file_path: &str) -> Option<DenyReason
         if prefix.is_empty() {
             continue;
         }
-        if resolved.starts_with(prefix) {
+        // Resolve the prefix too, so symlinks match (e.g., /tmp -> /private/tmp on macOS)
+        let resolved_prefix = resolve_path(prefix);
+        if resolved.starts_with(&resolved_prefix) {
             return None; // Path is within an allowed prefix
         }
     }
@@ -435,23 +446,43 @@ pub fn evaluate_file_path(tool_name: &str, file_path: &str) -> Option<DenyReason
 
 /// Resolve a file path to an absolute, canonical form.
 /// Handles symlinks and `..` components. Falls back to the raw path if resolution fails.
+///
+/// Walks up the path tree to find the deepest existing ancestor, canonicalizes it,
+/// then appends the remaining non-existent components. This ensures consistent
+/// resolution even when only part of the path exists (e.g., `/tmp` is a symlink
+/// to `/private/tmp` on macOS, but `/tmp/worktrees/myworktree` doesn't exist yet).
 fn resolve_path(path: &str) -> String {
     let p = Path::new(path);
 
-    // Try full canonicalize first (file exists)
+    // Try full canonicalize first (entire path exists)
     if let Ok(canonical) = p.canonicalize() {
         return canonical.to_string_lossy().to_string();
     }
 
-    // File doesn't exist — canonicalize parent, append filename
-    if let Some(parent) = p.parent() {
-        if let Ok(canonical_parent) = parent.canonicalize() {
-            if let Some(name) = p.file_name() {
-                return canonical_parent
-                    .join(name)
-                    .to_string_lossy()
-                    .to_string();
+    // Walk up the path tree to find the deepest existing ancestor,
+    // then rebuild with remaining components.
+    let mut to_append = Vec::new();
+    let mut current = p.to_path_buf();
+
+    loop {
+        if let Some(name) = current.file_name() {
+            to_append.push(name.to_os_string());
+        } else {
+            break;
+        }
+
+        match current.parent() {
+            Some(parent) => {
+                if let Ok(canonical) = parent.canonicalize() {
+                    let mut result = canonical;
+                    for component in to_append.iter().rev() {
+                        result = result.join(component);
+                    }
+                    return result.to_string_lossy().to_string();
+                }
+                current = parent.to_path_buf();
             }
+            None => break,
         }
     }
 
@@ -1344,65 +1375,67 @@ message = "medium priority"
     }
 
     // ── File path sandboxing ────────────────────────────
-
-    #[test]
-    fn file_path_allows_when_env_unset() {
-        std::env::remove_var("AGENT_ALLOWED_PATHS");
-        assert!(evaluate_file_path("Edit", "/some/random/path").is_none());
-        assert!(evaluate_file_path("Write", "/etc/passwd").is_none());
-    }
-
-    #[test]
-    fn file_path_allows_when_env_empty() {
-        std::env::set_var("AGENT_ALLOWED_PATHS", "");
-        assert!(evaluate_file_path("Read", "/any/path").is_none());
-        std::env::remove_var("AGENT_ALLOWED_PATHS");
-    }
+    //
+    // Tests use evaluate_file_path_with_allowed() to avoid env var races
+    // when tests run in parallel.
 
     #[test]
     fn file_path_allows_within_prefix() {
-        std::env::set_var("AGENT_ALLOWED_PATHS", "/tmp/worktrees/test:/tmp");
-        assert!(evaluate_file_path("Edit", "/tmp/worktrees/test/src/main.rs").is_none());
-        assert!(evaluate_file_path("Write", "/tmp/somefile.txt").is_none());
-        std::env::remove_var("AGENT_ALLOWED_PATHS");
+        let allowed = "/tmp/worktrees/test:/tmp";
+        assert!(evaluate_file_path_with_allowed(
+            "Edit",
+            "/tmp/worktrees/test/src/main.rs",
+            allowed
+        )
+        .is_none());
+        assert!(evaluate_file_path_with_allowed("Write", "/tmp/somefile.txt", allowed).is_none());
     }
 
     #[test]
     fn file_path_denies_outside_prefix() {
-        std::env::set_var("AGENT_ALLOWED_PATHS", "/tmp/worktrees/test");
-        let result = evaluate_file_path("Edit", "/Users/matt/real-repo/src/main.rs");
+        let allowed = "/tmp/worktrees/test";
+        let result =
+            evaluate_file_path_with_allowed("Edit", "/Users/matt/real-repo/src/main.rs", allowed);
         assert!(result.is_some());
-        assert!(result.unwrap().reason.contains("outside the allowed workspace"));
-        std::env::remove_var("AGENT_ALLOWED_PATHS");
+        assert!(result
+            .unwrap()
+            .reason
+            .contains("outside the allowed workspace"));
     }
 
     #[test]
     fn file_path_denies_read_outside() {
-        std::env::set_var("AGENT_ALLOWED_PATHS", "/tmp/worktrees/test");
-        let result = evaluate_file_path("Read", "/Users/matt/real-repo/secrets.env");
+        let allowed = "/tmp/worktrees/test";
+        let result =
+            evaluate_file_path_with_allowed("Read", "/Users/matt/real-repo/secrets.env", allowed);
         assert!(result.is_some());
-        std::env::remove_var("AGENT_ALLOWED_PATHS");
     }
 
     #[test]
     fn file_path_multiple_prefixes() {
-        std::env::set_var(
-            "AGENT_ALLOWED_PATHS",
-            "/tmp/worktrees/test:/home/user/.kb:/tmp",
+        let allowed = "/tmp/worktrees/test:/home/user/.kb:/tmp";
+        assert!(evaluate_file_path_with_allowed(
+            "Write",
+            "/home/user/.kb/workspace/task.md",
+            allowed,
+        )
+        .is_none());
+        assert!(
+            evaluate_file_path_with_allowed("Edit", "/tmp/worktrees/test/code.rs", allowed)
+                .is_none()
         );
-        assert!(evaluate_file_path("Write", "/home/user/.kb/workspace/task.md").is_none());
-        assert!(evaluate_file_path("Edit", "/tmp/worktrees/test/code.rs").is_none());
-        let result = evaluate_file_path("Edit", "/home/user/real-code/main.rs");
+        let result =
+            evaluate_file_path_with_allowed("Edit", "/home/user/real-code/main.rs", allowed);
         assert!(result.is_some());
-        std::env::remove_var("AGENT_ALLOWED_PATHS");
     }
 
     #[test]
     fn file_path_denial_includes_tool_name() {
-        std::env::set_var("AGENT_ALLOWED_PATHS", "/tmp/allowed");
-        let result = evaluate_file_path("NotebookEdit", "/forbidden/notebook.ipynb").unwrap();
+        let allowed = "/tmp/allowed";
+        let result =
+            evaluate_file_path_with_allowed("NotebookEdit", "/forbidden/notebook.ipynb", allowed)
+                .unwrap();
         assert!(result.reason.contains("NotebookEdit"));
-        std::env::remove_var("AGENT_ALLOWED_PATHS");
     }
 
     // ── handle_guard with tool_name ─────────────────────
@@ -1442,15 +1475,16 @@ message = "medium priority"
         assert!(hi.tool_input.as_ref().unwrap().file_path.is_none());
     }
 
+    #[cfg(not(windows))]
     #[test]
     fn resolve_path_handles_existing_paths() {
-        // /tmp should exist on all platforms
         let resolved = resolve_path("/tmp");
         assert!(resolved.starts_with('/'));
         // On macOS, /tmp -> /private/tmp
         assert!(resolved == "/tmp" || resolved == "/private/tmp");
     }
 
+    #[cfg(not(windows))]
     #[test]
     fn resolve_path_handles_nonexistent_files() {
         let resolved = resolve_path("/tmp/nonexistent_guard_test_file.rs");
