@@ -392,7 +392,7 @@ pub struct DenyReason {
 
 // ── File Path Sandboxing ────────────────────────────────
 
-/// Validate a file path against `AGENT_ALLOWED_PATHS` (colon-separated prefixes).
+/// Validate a file path against `AGENT_ALLOWED_PATHS` (OS-native path list: `:` on Unix, `;` on Windows).
 ///
 /// When the env var is unset or empty, all paths are allowed (interactive mode).
 /// When set, the resolved path must start with at least one allowed prefix.
@@ -424,13 +424,13 @@ fn evaluate_file_path_with_allowed(
         );
     }
 
-    for prefix in allowed.split(':') {
-        let prefix = prefix.trim();
-        if prefix.is_empty() {
+    // Use split_paths for OS-native parsing (`:` on Unix, `;` on Windows)
+    for prefix in std::env::split_paths(std::ffi::OsStr::new(allowed)) {
+        if prefix.as_os_str().is_empty() {
             continue;
         }
         // Resolve the prefix too, so symlinks match (e.g., /tmp -> /private/tmp on macOS)
-        let resolved_prefix = resolve_path(prefix);
+        let resolved_prefix = resolve_path(&prefix.to_string_lossy());
         if resolved.starts_with(&resolved_prefix) {
             return None; // Path is within an allowed prefix
         }
