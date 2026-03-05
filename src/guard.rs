@@ -313,41 +313,39 @@ pub fn handle_guard() -> Result<()> {
 
     let tool_name = hook_input.tool_name.as_deref().unwrap_or("");
 
-    // File-path tools: validate path against allowed directories
+    // File-path tools: validate ALL path fields against allowed directories.
+    // Both file_path and notebook_path are checked when present, preventing
+    // bypass via a payload that smuggles a second path field.
     if matches!(tool_name, "Edit" | "Write" | "Read" | "NotebookEdit") {
-        let path = hook_input
+        let paths: Vec<&String> = hook_input
             .tool_input
             .as_ref()
-            .and_then(|ti| ti.file_path.as_ref().or(ti.notebook_path.as_ref()));
-
-        match path {
-            Some(fp) => {
-                if let Some(denial) = evaluate_file_path(tool_name, fp) {
-                    let output = HookOutput {
-                        hook_specific_output: HookSpecificOutput {
-                            hook_event_name: "PreToolUse".to_string(),
-                            permission_decision: "deny".to_string(),
-                            permission_decision_reason: denial.reason,
-                        },
-                    };
-                    println!("{}", serde_json::to_string(&output)?);
+            .map(|ti| {
+                let mut v = Vec::new();
+                if let Some(fp) = ti.file_path.as_ref() {
+                    v.push(fp);
                 }
+                if let Some(np) = ti.notebook_path.as_ref() {
+                    v.push(np);
+                }
+                v
+            })
+            .unwrap_or_default();
+
+        if paths.is_empty() {
+            // When sandboxing is active, deny file-path tools with no path
+            // to prevent bypass via malformed payloads
+            if std::env::var_os("AGENT_ALLOWED_PATHS").is_some_and(|v| !v.is_empty()) {
+                emit_denial(format!(
+                    "{} blocked: no file path provided for sandboxed tool.",
+                    tool_name
+                ))?;
             }
-            None => {
-                // When sandboxing is active, deny file-path tools with no path
-                // to prevent bypass via malformed payloads
-                if std::env::var("AGENT_ALLOWED_PATHS").map_or(false, |v| !v.is_empty()) {
-                    let output = HookOutput {
-                        hook_specific_output: HookSpecificOutput {
-                            hook_event_name: "PreToolUse".to_string(),
-                            permission_decision: "deny".to_string(),
-                            permission_decision_reason: format!(
-                                "{} blocked: no file path provided for sandboxed tool.",
-                                tool_name
-                            ),
-                        },
-                    };
-                    println!("{}", serde_json::to_string(&output)?);
+        } else {
+            for fp in &paths {
+                if let Some(denial) = evaluate_file_path(tool_name, fp) {
+                    emit_denial(denial.reason)?;
+                    break;
                 }
             }
         }
@@ -365,14 +363,7 @@ pub fn handle_guard() -> Result<()> {
     };
 
     if let Some(denial) = evaluate_command(&command) {
-        let output = HookOutput {
-            hook_specific_output: HookSpecificOutput {
-                hook_event_name: "PreToolUse".to_string(),
-                permission_decision: "deny".to_string(),
-                permission_decision_reason: denial.reason,
-            },
-        };
-        println!("{}", serde_json::to_string(&output)?);
+        emit_denial(denial.reason)?;
     }
 
     Ok(())
@@ -415,6 +406,19 @@ pub struct DenyReason {
     pub reason: String,
 }
 
+/// Emit a denial JSON response to stdout.
+fn emit_denial(reason: String) -> Result<()> {
+    let output = HookOutput {
+        hook_specific_output: HookSpecificOutput {
+            hook_event_name: "PreToolUse".to_string(),
+            permission_decision: "deny".to_string(),
+            permission_decision_reason: reason,
+        },
+    };
+    println!("{}", serde_json::to_string(&output)?);
+    Ok(())
+}
+
 // ── File Path Sandboxing ────────────────────────────────
 
 /// Validate a file path against `AGENT_ALLOWED_PATHS` (OS-native path list: `:` on Unix, `;` on Windows).
@@ -423,8 +427,8 @@ pub struct DenyReason {
 /// When set, the resolved path must start with at least one allowed prefix.
 /// Resolves symlinks and `..` components to prevent path traversal escapes.
 pub fn evaluate_file_path(tool_name: &str, file_path: &str) -> Option<DenyReason> {
-    let allowed = match std::env::var("AGENT_ALLOWED_PATHS") {
-        Ok(v) if !v.is_empty() => v,
+    let allowed = match std::env::var_os("AGENT_ALLOWED_PATHS") {
+        Some(v) if !v.is_empty() => v.to_string_lossy().to_string(),
         _ => return None, // No restriction in interactive mode
     };
 
@@ -437,9 +441,21 @@ fn evaluate_file_path_with_allowed(
     file_path: &str,
     allowed: &str,
 ) -> Option<DenyReason> {
+    // Reject empty and relative paths early — Claude Code should always send absolute paths,
+    // so anything else is suspicious. This prevents CWD-dependent canonicalization surprises.
+    let trimmed_path = file_path.trim();
+    if trimmed_path.is_empty() || !Path::new(trimmed_path).is_absolute() {
+        return Some(DenyReason {
+            reason: format!(
+                "{} blocked: path must be absolute, got '{}'.",
+                tool_name, file_path
+            ),
+        });
+    }
+
     // Resolve the path to catch traversal (../../..) and symlink escapes.
     // For files that don't exist yet (Write creating new file), resolve the parent.
-    let resolved = resolve_path(file_path);
+    let resolved = resolve_path(trimmed_path);
 
     // Debug logging
     if std::env::var("META_DEBUG_GUARD").is_ok() {
@@ -510,7 +526,9 @@ fn resolve_path(path: &str) -> String {
     }
 
     // Last resort: normalize and return (already absolute from Claude Code)
-    normalize_path(Path::new(path)).to_string_lossy().to_string()
+    normalize_path(Path::new(path))
+        .to_string_lossy()
+        .to_string()
 }
 
 /// Normalize a path by collapsing `.` and `..` components logically.
@@ -1497,25 +1515,41 @@ message = "medium priority"
             "/tmp/worktrees/test/nonexistent/../../etc/passwd",
             allowed,
         );
-        assert!(
-            result.is_some(),
-            "path traversal via .. should be denied"
-        );
+        assert!(result.is_some(), "path traversal via .. should be denied");
     }
 
     #[test]
     fn file_path_denies_prefix_partial_match() {
         let allowed = "/tmp/safe";
         // /tmp/safevil should NOT match /tmp/safe
-        let result = evaluate_file_path_with_allowed(
-            "Edit",
-            "/tmp/safevil/malicious.sh",
-            allowed,
-        );
+        let result = evaluate_file_path_with_allowed("Edit", "/tmp/safevil/malicious.sh", allowed);
         assert!(
             result.is_some(),
             "partial directory name match should be denied"
         );
+    }
+
+    #[test]
+    fn file_path_denies_empty_path() {
+        let allowed = "/tmp/worktrees/test";
+        let result = evaluate_file_path_with_allowed("Edit", "", allowed);
+        assert!(result.is_some(), "empty path should be denied");
+        assert!(result.unwrap().reason.contains("must be absolute"));
+    }
+
+    #[test]
+    fn file_path_denies_whitespace_only_path() {
+        let allowed = "/tmp/worktrees/test";
+        let result = evaluate_file_path_with_allowed("Write", "   ", allowed);
+        assert!(result.is_some(), "whitespace-only path should be denied");
+    }
+
+    #[test]
+    fn file_path_denies_relative_path() {
+        let allowed = "/tmp/worktrees/test";
+        let result = evaluate_file_path_with_allowed("Write", "../../etc/passwd", allowed);
+        assert!(result.is_some(), "relative path should be denied");
+        assert!(result.unwrap().reason.contains("must be absolute"));
     }
 
     // ── handle_guard with tool_name ─────────────────────
