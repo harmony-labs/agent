@@ -1437,8 +1437,10 @@ message = "medium priority"
     // ── File path sandboxing ────────────────────────────
     //
     // Tests use evaluate_file_path_with_allowed() to avoid env var races
-    // when tests run in parallel.
+    // when tests run in parallel. Tests use Unix-style paths and are
+    // skipped on Windows where `/tmp/...` is not considered absolute.
 
+    #[cfg(not(windows))]
     #[test]
     fn file_path_allows_within_prefix() {
         let allowed = std::env::join_paths(["/tmp/worktrees/test", "/tmp"])
@@ -1455,6 +1457,7 @@ message = "medium priority"
         assert!(evaluate_file_path_with_allowed("Write", "/tmp/somefile.txt", allowed).is_none());
     }
 
+    #[cfg(not(windows))]
     #[test]
     fn file_path_denies_outside_prefix() {
         let allowed = "/tmp/worktrees/test";
@@ -1467,6 +1470,7 @@ message = "medium priority"
             .contains("outside the allowed workspace"));
     }
 
+    #[cfg(not(windows))]
     #[test]
     fn file_path_denies_read_outside() {
         let allowed = "/tmp/worktrees/test";
@@ -1475,6 +1479,7 @@ message = "medium priority"
         assert!(result.is_some());
     }
 
+    #[cfg(not(windows))]
     #[test]
     fn file_path_multiple_prefixes() {
         let allowed = std::env::join_paths(["/tmp/worktrees/test", "/home/user/.kb", "/tmp"])
@@ -1497,6 +1502,7 @@ message = "medium priority"
         assert!(result.is_some());
     }
 
+    #[cfg(not(windows))]
     #[test]
     fn file_path_denial_includes_tool_name() {
         let allowed = "/tmp/allowed";
@@ -1506,6 +1512,7 @@ message = "medium priority"
         assert!(result.reason.contains("NotebookEdit"));
     }
 
+    #[cfg(not(windows))]
     #[test]
     fn file_path_denies_traversal_via_dotdot() {
         let allowed = "/tmp/worktrees/test";
@@ -1518,6 +1525,7 @@ message = "medium priority"
         assert!(result.is_some(), "path traversal via .. should be denied");
     }
 
+    #[cfg(not(windows))]
     #[test]
     fn file_path_denies_prefix_partial_match() {
         let allowed = "/tmp/safe";
@@ -1529,6 +1537,7 @@ message = "medium priority"
         );
     }
 
+    #[cfg(not(windows))]
     #[test]
     fn file_path_denies_empty_path() {
         let allowed = "/tmp/worktrees/test";
@@ -1537,6 +1546,7 @@ message = "medium priority"
         assert!(result.unwrap().reason.contains("must be absolute"));
     }
 
+    #[cfg(not(windows))]
     #[test]
     fn file_path_denies_whitespace_only_path() {
         let allowed = "/tmp/worktrees/test";
@@ -1544,6 +1554,7 @@ message = "medium priority"
         assert!(result.is_some(), "whitespace-only path should be denied");
     }
 
+    #[cfg(not(windows))]
     #[test]
     fn file_path_denies_relative_path() {
         let allowed = "/tmp/worktrees/test";
