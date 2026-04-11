@@ -7,7 +7,7 @@ A standalone CLI for Claude Code agent integration. Provides deterministic comma
 ## Installation
 
 ```bash
-cargo install --git https://github.com/harmony-labs/agent
+cargo install --git https://github.com/gitkb/agent
 ```
 
 Or build from source:
